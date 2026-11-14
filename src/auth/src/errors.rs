@@ -85,14 +85,21 @@ pub(crate) fn from_http_error(err: reqwest::Error, msg: &str) -> CredentialsErro
 }
 
 pub(crate) async fn from_http_response(response: reqwest::Response, msg: &str) -> CredentialsError {
-    let err = response
-        .error_for_status_ref()
-        .expect_err("this function is only called on errors");
+    let status = response.status();
+    // `error_for_status_ref()` only returns an error for 4xx and 5xx statuses.
+    // The callers check for `!status.is_success()`, which also includes the
+    // 1xx and 3xx statuses (e.g. a 304 or a redirect without a `Location`
+    // header). Those must not panic.
+    let err = response.error_for_status_ref().err();
+    let transient = err.as_ref().is_some_and(crate::errors::is_retryable);
     let body = response.text().await;
-    let transient = crate::errors::is_retryable(&err);
-    match body {
-        Err(e) => CredentialsError::new(transient, msg, e),
-        Ok(b) => CredentialsError::new(transient, format!("{msg}, body=<{b}>"), err),
+    match (body, err) {
+        (Err(e), _) => CredentialsError::new(transient, msg, e),
+        (Ok(b), Some(err)) => CredentialsError::new(transient, format!("{msg}, body=<{b}>"), err),
+        (Ok(b), None) => CredentialsError::from_msg(
+            transient,
+            format!("{msg}, status={}, body=<{b}>", status.as_u16()),
+        ),
     }
 }
 
@@ -188,6 +195,40 @@ mod tests {
         assert!(!e.is_transient(), "{e:?}");
         let source = e.source().and_then(|e| e.downcast_ref::<ParseIntError>());
         assert!(matches!(source, Some(ParseIntError { .. })), "{e:?}");
+    }
+
+    #[test_case(StatusCode::INTERNAL_SERVER_ERROR, true)]
+    #[test_case(StatusCode::TOO_MANY_REQUESTS, true)]
+    #[test_case(StatusCode::NOT_FOUND, false)]
+    #[test_case(StatusCode::UNAUTHORIZED, false)]
+    #[tokio::test]
+    async fn from_http_response_error_status(code: StatusCode, want_transient: bool) {
+        let response = http::Response::builder()
+            .status(code)
+            .body("test-only-body")
+            .unwrap();
+        let err = from_http_response(response.into(), "test-only-msg").await;
+        assert_eq!(err.is_transient(), want_transient, "{err:?}");
+        let got = format!("{err}");
+        assert!(got.contains("test-only-msg"), "{got}");
+        assert!(got.contains("body=<test-only-body>"), "{got}");
+    }
+
+    #[test_case(StatusCode::MULTIPLE_CHOICES)]
+    #[test_case(StatusCode::NOT_MODIFIED)]
+    #[test_case(StatusCode::TEMPORARY_REDIRECT)]
+    #[tokio::test]
+    async fn from_http_response_non_error_status(code: StatusCode) {
+        let response = http::Response::builder()
+            .status(code)
+            .body("test-only-body")
+            .unwrap();
+        let err = from_http_response(response.into(), "test-only-msg").await;
+        assert!(!err.is_transient(), "{err:?}");
+        let got = format!("{err}");
+        assert!(got.contains("test-only-msg"), "{got}");
+        assert!(got.contains(&format!("status={}", code.as_u16())), "{got}");
+        assert!(got.contains("body=<test-only-body>"), "{got}");
     }
 
     #[test_case(GaxError::http(503, HeaderMap::new(), Bytes::from("test")), true ; "retryable http status")]
