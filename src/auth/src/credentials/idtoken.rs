@@ -314,8 +314,9 @@ fn parse_id_token_from_str_impl(token: String, now: SystemTime) -> Result<Token>
     let claims: HashMap<String, Value> =
         serde_json::from_slice(&payload).map_err(|e| CredentialsError::from_source(false, e))?;
 
-    let expires_at = claims["exp"]
-        .as_u64()
+    let expires_at = claims
+        .get("exp")
+        .and_then(Value::as_u64)
         .and_then(|exp| instant_from_epoch_seconds(exp, now));
 
     Ok(Token {
@@ -327,10 +328,19 @@ fn parse_id_token_from_str_impl(token: String, now: SystemTime) -> Result<Token>
 }
 
 fn instant_from_epoch_seconds(secs: u64, now: SystemTime) -> Option<Instant> {
-    now.duration_since(UNIX_EPOCH).ok().map(|d| {
-        let diff = d.abs_diff(Duration::from_secs(secs));
-        Instant::now() + diff
-    })
+    let now_secs = now.duration_since(UNIX_EPOCH).ok()?;
+    let expiration = Duration::from_secs(secs);
+    let instant = Instant::now();
+    match expiration.checked_sub(now_secs) {
+        Some(remaining) => instant.checked_add(remaining),
+        // The token is already expired. Place the expiration in the past, so
+        // the token is not treated as valid.
+        None => Some(
+            instant
+                .checked_sub(now_secs - expiration)
+                .unwrap_or(instant),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -465,6 +475,37 @@ pub(crate) mod tests {
             ts - Duration::from_secs(ts.as_secs())
         };
         assert_eq!(expiration + rounding, DEFAULT_TEST_TOKEN_EXPIRATION);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[parallel]
+    async fn test_parse_id_token_expired() -> TestResult {
+        let now = SystemTime::now();
+        let past = (now.duration_since(UNIX_EPOCH)? - Duration::from_secs(3600)).as_secs();
+        let claims = HashMap::from([("exp", Value::from(past))]);
+        let id_token = generate_test_id_token_impl("https://example.com".to_string(), claims, now);
+
+        let token = parse_id_token_from_str_impl(id_token, now)?;
+
+        let expires_at = token.expires_at.expect("the `exp` claim is present");
+        assert!(expires_at <= Instant::now(), "{token:?}");
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[parallel]
+    async fn test_parse_id_token_missing_exp() -> TestResult {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(r#"{"aud":"https://example.com"}"#);
+        let id_token = format!("{header}.{payload}.signature");
+
+        let token = parse_id_token_from_str_impl(id_token.clone(), SystemTime::now())?;
+
+        assert_eq!(token.token, id_token);
+        assert_eq!(token.expires_at, None, "{token:?}");
 
         Ok(())
     }
